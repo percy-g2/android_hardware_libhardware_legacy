@@ -22,6 +22,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <poll.h>
+#include <sys/utsname.h>
 
 #include "hardware_legacy/wifi.h"
 #include "libwpa_client/wpa_ctrl.h"
@@ -50,6 +51,11 @@
 static struct wpa_ctrl *ctrl_conn[MAX_CONNS];
 static struct wpa_ctrl *monitor_conn[MAX_CONNS];
 
+#ifdef CSPSA
+#include "cspsa.h"
+#define D_CSPSA_DEFAULT_NAME "CSPSA0"
+#endif
+
 /* socket pair used to exit from a blocking read */
 static int exit_sockets[MAX_CONNS][2];
 
@@ -71,7 +77,9 @@ static char primary_iface[PROPERTY_VALUE_MAX];
 #ifndef WIFI_FIRMWARE_LOADER
 #define WIFI_FIRMWARE_LOADER		""
 #endif
+#ifndef WIFI_TEST_INTERFACE
 #define WIFI_TEST_INTERFACE		"sta"
+#endif
 
 #ifndef WIFI_DRIVER_FW_PATH_STA
 #define WIFI_DRIVER_FW_PATH_STA		NULL
@@ -82,18 +90,35 @@ static char primary_iface[PROPERTY_VALUE_MAX];
 #ifndef WIFI_DRIVER_FW_PATH_P2P
 #define WIFI_DRIVER_FW_PATH_P2P		NULL
 #endif
+#ifdef CSPSA
+#define WLAN_MAC_ADDR_SIZE              6
+#define CSPSA_WLAN_MAC_ADDR_KEY         0x00010000
+#endif
+
+#define MAC_FMT                         "0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x"
+#define WIFI_DRIVER_LOAD_DELAY          1
 
 #ifndef WIFI_DRIVER_FW_PATH_PARAM
 #define WIFI_DRIVER_FW_PATH_PARAM	"/sys/module/wlan/parameters/fwpath"
 #endif
+#ifndef WIFI_FIRMWARE_DELAY_COUNT
+#define WIFI_FIRMWARE_DELAY_COUNT       20
+#endif
+#ifndef WIFI_FIRMWARE_LOADER_DELAY
+#define WIFI_FIRMWARE_LOADER_DELAY      250000
+#endif
+#ifndef WIFI_NET_DEVICE_STATUS_PATH
+#define WIFI_NET_DEVICE_STATUS_PATH     "/proc/net/dev"
+#endif
 
-#define WIFI_DRIVER_LOADER_DELAY	1000000
+
+#define MAX_STRING_LENGTH 255
 
 static const char IFACE_DIR[]           = "/data/system/wpa_supplicant";
 #ifdef WIFI_DRIVER_MODULE_PATH
 static const char DRIVER_MODULE_NAME[]  = WIFI_DRIVER_MODULE_NAME;
 static const char DRIVER_MODULE_TAG[]   = WIFI_DRIVER_MODULE_NAME " ";
-static const char DRIVER_MODULE_PATH[]  = WIFI_DRIVER_MODULE_PATH;
+static const char DRIVER_MODULE_PATH[MAX_STRING_LENGTH];
 static const char DRIVER_MODULE_ARG[]   = WIFI_DRIVER_MODULE_ARG;
 #endif
 static const char FIRMWARE_LOADER[]     = WIFI_FIRMWARE_LOADER;
@@ -105,8 +130,91 @@ static const char P2P_PROP_NAME[]       = "init.svc.p2p_supplicant";
 static const char SUPP_CONFIG_TEMPLATE[]= "/system/etc/wifi/wpa_supplicant.conf";
 static const char SUPP_CONFIG_FILE[]    = "/data/misc/wifi/wpa_supplicant.conf";
 static const char P2P_CONFIG_FILE[]     = "/data/misc/wifi/p2p_supplicant.conf";
-static const char CONTROL_IFACE_PATH[]  = "/data/misc/wifi/sockets";
+static const char CONTROL_IFACE_PATH[]  = "/data/system/wpa_supplicant";
 static const char MODULE_FILE[]         = "/proc/modules";
+static const char WLAN_MAC_ADDRESS_PARAM_NAME[]                = "macaddr";
+static const char WLAN_INVALID_MAC_ADDRESS[]                   = {0x00};
+
+static int wifi_fetch_mac(char* wifi_driver_param)
+{
+    int found = 0;
+    int ret = -1;
+
+#ifdef CSPSA
+    CSPSA_Result_t result;
+    CSPSA_Handle_t handle;
+    CSPSA_Size_t size;
+    CSPSA_Key_t key = CSPSA_WLAN_MAC_ADDR_KEY;
+    CSPSA_Data_t *cspsa_data = NULL;
+
+    result = CSPSA_Open(D_CSPSA_DEFAULT_NAME, &handle);
+    if (result != T_CSPSA_RESULT_OK) {
+        ALOGE("Can't open CSPSA area (result 0x%X) ", result);
+        goto cspsa_finished;
+    }
+
+    result = CSPSA_GetSizeOfValue(handle, key, &size);
+    if (result != T_CSPSA_RESULT_OK) {
+        ALOGE("Can't get size of key (h %p key 0x%x result 0x%X).",
+          handle, key, result);
+        goto cspsa_finished;
+    }
+
+    if (size != WLAN_MAC_ADDR_SIZE) {
+        ALOGE("Read wrong amount of bytes: %d", size);
+        goto cspsa_finished;
+    }
+
+    cspsa_data = (CSPSA_Data_t *) malloc(size);
+    if (!cspsa_data) {
+        ALOGE("Can't malloc %d bytes.", size);
+        goto cspsa_finished;
+    }
+
+    result = CSPSA_ReadValue(handle, key, size, cspsa_data);
+    if (result != T_CSPSA_RESULT_OK) {
+        ALOGE("Can't read from CSPSA (h %p  key 0x%x size %d res 0x%X).",
+            handle, key, size, result);
+        goto cspsa_finished;
+    }
+
+    /* Don't use CSPSA MAC address if it ends with :00:00:00.*/
+    if ((0 == cspsa_data[3]) && (0 == cspsa_data[4]) && (0 == cspsa_data[5])) {
+        ALOGI("Default MAC address read from CSPSA. Using random.");
+        goto cspsa_finished;
+    }
+
+    found = 1;
+    ret = 0; //success
+    memcpy(wifi_driver_param, cspsa_data, WLAN_MAC_ADDR_SIZE);
+    ALOGI("MAC address from CSPSA [0x%02x:0x%02x:0x%02x:0x%02x:0x%02x:0x%02x]",
+         cspsa_data[0], cspsa_data[1], cspsa_data[2],
+         cspsa_data[3], cspsa_data[4], cspsa_data[5]);
+
+cspsa_finished:
+    if (cspsa_data)
+        free(cspsa_data);
+    result = CSPSA_Close(&handle);
+    if (result != T_CSPSA_RESULT_OK)
+        ALOGE("Can't close CSPSA area (result %x) ", result);
+#endif
+    if (found == 0) {
+      memcpy(wifi_driver_param, WLAN_INVALID_MAC_ADDRESS,
+              sizeof(WLAN_INVALID_MAC_ADDRESS));
+    }
+    return ret;
+}
+
+static void wifi_format_mac_param(char* mac)
+{
+    char mac_address[100];
+    sprintf(mac_address, MAC_FMT,
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    mac[0] = ' '; //one space to separate insmod parameters
+    strcpy(&mac[1], WLAN_MAC_ADDRESS_PARAM_NAME);
+    strcat(mac, "=");
+    strcat(mac, mac_address);
+}
 
 static const char SUPP_ENTROPY_FILE[]   = WIFI_ENTROPY_FILE;
 static unsigned char dummy_key[21] = { 0x02, 0x11, 0xbe, 0x33, 0x43, 0x35,
@@ -134,12 +242,23 @@ static int insmod(const char *filename, const char *args)
     void *module;
     unsigned int size;
     int ret;
+    char driver_module_arg[255];
+    char mac_address_param[255];
 
     module = load_file(filename, &size);
     if (!module)
         return -1;
 
-    ret = init_module(module, size, args);
+    sleep(WIFI_DRIVER_LOAD_DELAY);
+    strcpy(driver_module_arg, args);
+
+    if (0 == wifi_fetch_mac(mac_address_param)) {
+        wifi_format_mac_param(mac_address_param);
+    }
+    strcat(driver_module_arg, mac_address_param);
+    ALOGI("***wlan.ko (%s)", driver_module_arg);
+
+    ret = init_module(module, size, driver_module_arg);
 
     free(module);
 
@@ -224,21 +343,63 @@ int is_wifi_driver_loaded() {
 #endif
 }
 
+/*
+ * The function is waiting until WIFI_TEST_INTERFACE interface will be created.
+ * Waits at most WIFI_FIRMWARE_DELAY_COUNT*WIFI_FIRMWARE_LOADER_DELAY/10^6 seconds
+ * for completion
+ * @returns 0 if WIFI_TEST_INTERFACE interface was created properly
+ * @returns < 0, it indicates that WIFI_TEST_INTERFACE interface wasn't created
+ */
+static int waiting_for_wlan_interface() {
+    FILE *proc;
+    char line[sizeof(WIFI_TEST_INTERFACE)+10];
+    int count = WIFI_FIRMWARE_DELAY_COUNT;
+
+    while (count--) {
+        if ((proc = fopen(WIFI_NET_DEVICE_STATUS_PATH, "r")) == NULL) {
+            ALOGI("Could not open %s: %s", WIFI_NET_DEVICE_STATUS_PATH, strerror(errno));
+            return -1;
+        }
+
+        while ((fgets(line, sizeof(line), proc)) != NULL) {
+            if (strstr(line, WIFI_TEST_INTERFACE) != NULL) {
+                fclose(proc);
+                return 0;
+            }
+        }
+
+        fclose(proc);
+        usleep(WIFI_FIRMWARE_LOADER_DELAY);
+    }
+
+    return -1;
+}
+
 int wifi_load_driver()
 {
 #ifdef WIFI_DRIVER_MODULE_PATH
     char driver_status[PROPERTY_VALUE_MAX];
     int count = 100; /* wait at most 20 seconds for completion */
+    struct utsname uname_buf;
 
     if (is_wifi_driver_loaded()) {
         return 0;
     }
 
+    if (uname(&uname_buf))
+        return -1;
+
+    snprintf(DRIVER_MODULE_PATH, MAX_STRING_LENGTH, WIFI_DRIVER_MODULE_PATH,
+                                      uname_buf.release, DRIVER_MODULE_NAME);
+
+    ALOGI("***%s (%s)", DRIVER_MODULE_PATH, DRIVER_MODULE_ARG);
+
     if (insmod(DRIVER_MODULE_PATH, DRIVER_MODULE_ARG) < 0)
         return -1;
 
     if (strcmp(FIRMWARE_LOADER,"") == 0) {
-        /* usleep(WIFI_DRIVER_LOADER_DELAY); */
+        if (waiting_for_wlan_interface() != 0)
+            return -1;
         property_set(DRIVER_PROP_NAME, "ok");
     }
     else {
@@ -277,11 +438,11 @@ int wifi_unload_driver()
             usleep(500000);
         }
         usleep(500000); /* allow card removal */
+
         if (count) {
             return 0;
         }
-        return -1;
-    } else
+    }
         return -1;
 #else
     property_set(DRIVER_PROP_NAME, "unloaded");
@@ -362,11 +523,7 @@ int update_ctrl_interface(const char *config_file) {
         return 0;
     }
 
-    if (!strcmp(config_file, SUPP_CONFIG_FILE)) {
-        property_get("wifi.interface", ifc, WIFI_TEST_INTERFACE);
-    } else {
         strcpy(ifc, CONTROL_IFACE_PATH);
-    }
     if ((sptr = strstr(pbuf, "ctrl_interface="))) {
         char *iptr = sptr + strlen("ctrl_interface=");
         int ilen = 0;
@@ -619,6 +776,7 @@ int wifi_stop_supplicant()
 int wifi_connect_on_socket_path(int index, const char *path)
 {
     char supp_status[PROPERTY_VALUE_MAX] = {'\0'};
+    int count = 25;
 
     /* Make sure supplicant is running */
     if (!property_get(supplicant_prop_name, supp_status, NULL)
@@ -798,6 +956,7 @@ void wifi_close_sockets(int index)
     }
 
     if (monitor_conn[index] != NULL) {
+        shutdown(wpa_ctrl_get_fd(monitor_conn[index]), SHUT_RDWR);
         wpa_ctrl_close(monitor_conn[index]);
         monitor_conn[index] = NULL;
     }
